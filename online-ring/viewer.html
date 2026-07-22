@@ -184,7 +184,12 @@
           const img = extract(g, bin, meta.imageIndex);
           metalEnv = await loadEnv(img.blob, img.mime || meta.mimeType);
           scene.environment = metalEnv;
-          scene.environmentIntensity = 0.55;
+          // Honor intensity baked into the GLB (not a hard-coded viewer boost)
+          const envIntensity = (typeof meta.intensity === 'number') ? meta.intensity : 0.55;
+          scene.environmentIntensity = envIntensity;
+          if (typeof meta.exposure === 'number') {
+            renderer.toneMappingExposure = meta.exposure;
+          }
           gemEnv = metalEnv;
         } catch (e) { console.warn(e); }
       }
