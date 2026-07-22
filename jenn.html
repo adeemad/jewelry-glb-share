@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <title>Jenn Zeiss solitaire</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #f3f3f3; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #status {
+      position: absolute; left: 12px; bottom: 12px; z-index: 2;
+      padding: 8px 10px; border-radius: 8px; font: 12px/1.35 "Segoe UI", sans-serif;
+      color: #444; background: rgba(255,255,255,.72); pointer-events: none;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+      "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.11/build/index.module.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="status">Loading…</div>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+    import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+    import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+    import { MeshBVH, MeshBVHUniformStruct, BVHShaderGLSL, SAH } from 'three-mesh-bvh';
+
+    const status = document.getElementById('status');
+    const params = new URLSearchParams(location.search);
+    const MODEL = './JennZeiss-ring_SHOPIFY.glb'; // hard-locked solitaire
+    const AUTO_ROTATE = params.get('rotate') !== '0';
+
+    function parseGlb(buf) {
+      const u8 = new Uint8Array(buf);
+      const dv = new DataView(buf);
+      const jsonLen = dv.getUint32(12, true);
+      const jsonBytes = u8.slice(20, 20 + jsonLen);
+      let end = jsonBytes.length;
+      while (end > 0 && (jsonBytes[end - 1] === 0x20 || jsonBytes[end - 1] === 0)) end--;
+      const g = JSON.parse(new TextDecoder().decode(jsonBytes.slice(0, end)));
+      const binOff = 20 + jsonLen;
+      const binLen = dv.getUint32(binOff, true);
+      const bin = u8.slice(binOff + 8, binOff + 8 + binLen);
+      return { g, bin };
+    }
+
+    function envMeta(g) {
+      return g?.asset?.extras?.adabEmbeddedEnvironment
+        || g?.scenes?.[0]?.extras?.adabEmbeddedEnvironment
+        || null;
+    }
+
+    function extractImageBlob(g, bin, imageIndex) {
+      if (imageIndex == null || !g.images?.[imageIndex]) return null;
+      const img = g.images[imageIndex];
+      const bv = g.bufferViews[img.bufferView];
+      const slice = bin.slice(bv.byteOffset || 0, (bv.byteOffset || 0) + bv.byteLength);
+      return { blob: new Blob([slice], { type: img.mimeType || 'application/octet-stream' }), mime: img.mimeType || '' };
+    }
+
+    async function loadEnvMap(blob, mime) {
+      const url = URL.createObjectURL(blob);
+      try {
+        const loader = /exr/i.test(mime) ? new EXRLoader() : new RGBELoader();
+        const tex = await loader.loadAsync(url);
+        tex.mapping = THREE.EquirectangularReflectionMapping;
+        tex.generateMipmaps = true;
+        tex.minFilter = THREE.LinearMipmapLinearFilter;
+        return tex;
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+
+    function isDiamond(m, mesh) {
+      if (m?.userData?.adabMaterialRole === 'diamond') return true;
+      if ((m?.name || '').toLowerCase().includes('diamond')) return true;
+      if ((mesh?.name || '').toLowerCase() === 'diamond') return true;
+      return false;
+    }
+
+    function isHiddenObject(o) {
+      let p = o;
+      while (p) {
+        const ex = p.userData || {};
+        if (ex.adabHidden) return true;
+        if ((p.name || '') === 'Engraving') return true;
+        if (ex.SimpleTextPlugin) return true;
+        p = p.parent;
+      }
+      return false;
+    }
+
+    function makeDiamondMaterial(env, camera, cfg = {}) {
+      const ior = cfg.ior ?? 2.4;
+      const aberrationStrength = cfg.aberrationStrength ?? 0.014;
+      const bounces = cfg.bounces ?? 5;
+      return new THREE.ShaderMaterial({
+        uniforms: {
+          envMap: { value: env },
+          bvh: { value: new MeshBVHUniformStruct() },
+          viewMatrixInv: { value: camera.matrixWorld },
+          resolution: { value: new THREE.Vector2(innerWidth, innerHeight) },
+          bounces: { value: bounces },
+          ior: { value: ior },
+          color: { value: new THREE.Color(1, 1, 1) },
+          aberrationStrength: { value: aberrationStrength },
+        },
+        vertexShader: /* glsl */ `
+          varying vec3 vWorldPosition;
+          varying vec3 vNormal;
+          uniform mat4 viewMatrixInv;
+          void main() {
+            vWorldPosition = (modelMatrix * vec4(position, 1.0)).xyz;
+            vNormal = normalize((viewMatrixInv * vec4(normalMatrix * normal, 0.0)).xyz);
+            gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: /* glsl */ `
+          #define RAY_OFFSET 0.001
+          #include <common>
+          precision highp isampler2D;
+          precision highp usampler2D;
+          ${BVHShaderGLSL.common_functions}
+          ${BVHShaderGLSL.bvh_struct_definitions}
+          ${BVHShaderGLSL.bvh_ray_functions}
+          varying vec3 vWorldPosition;
+          varying vec3 vNormal;
+          uniform sampler2D envMap;
+          uniform float bounces;
+          uniform BVH bvh;
+          uniform float ior;
+          uniform vec3 color;
+          uniform mat4 modelMatrix;
+          uniform float aberrationStrength;
+          #include <cube_uv_reflection_fragment>
+
+          vec3 tir(vec3 origin, vec3 dir, vec3 normal, float iorVal, mat4 invModel) {
+            vec3 rayOrigin = origin;
+            vec3 rayDirection = dir;
+            rayDirection = refract(rayDirection, normal, 1.0 / iorVal);
+            rayOrigin = vWorldPosition + rayDirection * RAY_OFFSET;
+            rayOrigin = (invModel * vec4(rayOrigin, 1.0)).xyz;
+            rayDirection = normalize((invModel * vec4(rayDirection, 0.0)).xyz);
+            for (float i = 0.0; i < bounces; i++) {
+              uvec4 faceIndices = uvec4(0u);
+              vec3 faceNormal = vec3(0.0, 0.0, 1.0);
+              vec3 barycoord = vec3(0.0);
+              float side = 1.0;
+              float dist = 0.0;
+              bvhIntersectFirstHit(bvh, rayOrigin, rayDirection, faceIndices, faceNormal, barycoord, side, dist);
+              vec3 hitPos = rayOrigin + rayDirection * dist;
+              bool isTir = length(refract(rayDirection, faceNormal, iorVal)) == 0.0;
+              if (!isTir) { rayDirection = refract(rayDirection, faceNormal, iorVal); break; }
+              rayDirection = reflect(rayDirection, faceNormal);
+              rayOrigin = hitPos + rayDirection * RAY_OFFSET;
+            }
+            return normalize((modelMatrix * vec4(rayDirection, 0.0)).xyz);
+          }
+
+          vec4 envSample(vec3 d) { return texture(envMap, equirectUv(d)); }
+
+          void main() {
+            mat4 invModel = inverse(modelMatrix);
+            vec3 n = normalize(vNormal);
+            vec3 d = normalize(vWorldPosition - cameraPosition);
+            vec3 gDir = tir(cameraPosition, d, n, max(ior, 1.0), invModel);
+            vec3 rDir = tir(cameraPosition, d, n, max(ior * (1.0 - aberrationStrength), 1.0), invModel);
+            vec3 bDir = tir(cameraPosition, d, n, max(ior * (1.0 + aberrationStrength), 1.0), invModel);
+            gl_FragColor = vec4(vec3(envSample(rDir).r, envSample(gDir).g, envSample(bDir).b) * color, 1.0);
+            #include <tonemapping_fragment>
+            #include <colorspace_fragment>
+          }
+        `,
+      });
+    }
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xf3f3f3);
+    const camera = new THREE.PerspectiveCamera(32, innerWidth / innerHeight, 0.01, 100);
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', alpha: false });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.autoRotate = AUTO_ROTATE;
+    controls.autoRotateSpeed = 0.55;
+    controls.minDistance = 0.2;
+    controls.maxDistance = 20;
+
+    const key = new THREE.DirectionalLight(0xfff5ea, 0.55);
+    key.position.set(3, 5, 4);
+    scene.add(key);
+    const fill = new THREE.DirectionalLight(0xe8eef8, 0.25);
+    fill.position.set(-4, 2, -3);
+    scene.add(fill);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.15));
+
+    status.textContent = 'Fetching model…';
+    const ab = await fetch(MODEL).then((r) => {
+      if (!r.ok) throw new Error('Failed to load ' + MODEL);
+      return r.arrayBuffer();
+    });
+    const { g, bin } = parseGlb(ab);
+    const meta = envMeta(g);
+    if (!meta || meta.imageIndex == null) throw new Error('GLB missing embedded HDR (adabEmbeddedEnvironment)');
+
+    status.textContent = 'Loading packed HDR…';
+    const metalImg = extractImageBlob(g, bin, meta.imageIndex);
+    const metalEnv = await loadEnvMap(metalImg.blob, metalImg.mime);
+    scene.environment = metalEnv;
+
+    let gemEnv = metalEnv;
+    if (meta.gemImageIndex != null) {
+      status.textContent = 'Loading packed gem EXR…';
+      const gemImg = extractImageBlob(g, bin, meta.gemImageIndex);
+      if (gemImg) {
+        try {
+          gemEnv = await loadEnvMap(gemImg.blob, gemImg.mime || meta.gemMimeType || 'image/x-exr');
+        } catch (e) {
+          console.warn('Gem EXR failed, using metal HDR for diamond', e);
+        }
+      }
+    }
+
+    status.textContent = 'Loading mesh…';
+    const draco = new DRACOLoader();
+    draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/draco/');
+    const loader = new GLTFLoader();
+    loader.setDRACOLoader(draco);
+    const gltf = await loader.parseAsync(ab, '');
+    const root = gltf.scene;
+    scene.add(root);
+    root.updateMatrixWorld(true);
+
+    // Hide engraving / helper nodes so they don't skew look or framing
+    root.traverse((o) => {
+      if (isHiddenObject(o)) {
+        o.visible = false;
+      }
+    });
+
+    const diamondMats = [];
+    let diamondCount = 0;
+    const visibleMeshes = [];
+
+    root.traverse((o) => {
+      if (!o.isMesh || !o.visible) return;
+      visibleMeshes.push(o);
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+
+      if (!mats.some((m) => isDiamond(m, o))) {
+        for (const m of mats) {
+          if (!m) continue;
+          // Fix bad BLEND metals from source exports
+          if (m.transparent || m.opacity < 1) {
+            m.transparent = false;
+            m.opacity = 1;
+            m.depthWrite = true;
+          }
+          m.envMapIntensity = m.userData?.adabMaterialRole === 'metal' ? 1.35 : 1.0;
+          if (m.userData?.adabMaterialRole === 'metal' || (m.name || '').toLowerCase().includes('gold')) {
+            if ('metalness' in m) m.metalness = 1.0;
+            if ('roughness' in m) m.roughness = Math.min(Math.max(m.roughness ?? 0.08, 0.04), 0.18);
+          }
+          m.needsUpdate = true;
+        }
+        return;
+      }
+
+      const cfg = mats.find((m) => isDiamond(m, o))?.userData?.adabDiamond || {};
+      // Keep diamond in hierarchy; build BVH in local space (no world bake / reparent)
+      const geo = o.geometry;
+      geo.computeVertexNormals();
+      const bvh = new MeshBVH(geo, { strategy: SAH, maxLeafTris: 1 });
+      const mat = makeDiamondMaterial(gemEnv, camera, cfg);
+      mat.uniforms.bvh.value.updateFrom(bvh);
+      diamondMats.push(mat);
+      o.material = mat;
+      o.renderOrder = 2;
+      diamondCount++;
+    });
+
+    // Frame visible jewelry only (ignore hidden engraving)
+    const box = new THREE.Box3();
+    for (const m of visibleMeshes) {
+      if (!m.visible) continue;
+      box.expandByObject(m);
+    }
+    if (box.isEmpty()) box.setFromObject(root);
+
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    // Match product 3/4 hero angle (diamond up-right, looking slightly into hoop)
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    controls.target.copy(center);
+    camera.position.set(
+      center.x + maxDim * 0.95,
+      center.y + maxDim * 0.72,
+      center.z + maxDim * 1.55,
+    );
+    camera.near = maxDim / 250;
+    camera.far = maxDim * 100;
+    camera.updateProjectionMatrix();
+    controls.update();
+
+    const composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+    composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.18, 0.45, 0.88));
+    composer.addPass(new OutputPass());
+
+    status.textContent = `JennZeiss-ring_SHOPIFY.glb · ${diamondCount} diamonds · solitaire`;
+
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      composer.setSize(innerWidth, innerHeight);
+      for (const m of diamondMats) m.uniforms.resolution.value.set(innerWidth, innerHeight);
+    });
+
+    renderer.setAnimationLoop(() => {
+      controls.update();
+      composer.render();
+    });
+  </script>
+</body>
+</html>
