@@ -1,0 +1,6 @@
+Online multi-diamond ring (fully baked except sparkle)
+Source: https://webgi.bornfight.studio/static/models/pixotronics-bfs-v4.glb
+Demo model from Bornfight / Pixotronics WebGi samples.
+Confirm licensing before commercial client delivery.
+Diamond meshes: 69
+Packed: geometry, materials, HDR, EXR. Sparkle via viewer.

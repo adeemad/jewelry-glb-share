@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <title>Online multi-diamond ring</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #f2f2f2; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #status {
+      position: absolute; left: 12px; bottom: 12px; z-index: 2; max-width: 92vw;
+      padding: 10px 12px; border-radius: 8px; font: 13px/1.4 system-ui, sans-serif;
+      color: #222; background: rgba(255,255,255,.92);
+    }
+    #status.err { color: #8b0000; background: #ffe4e4; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+      "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.11/build/index.module.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="status">Starting…</div>
+  <script type="module">
+    const el = document.getElementById('status');
+    const set = (t, err = false) => { el.textContent = t; el.classList.toggle('err', !!err); };
+    const MODEL = './Online-PaveHalo-Ring_FULLY_BAKED.glb';
+
+    try {
+      const THREE = await import('three');
+      const { OrbitControls } = await import('three/addons/controls/OrbitControls.js');
+      const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js');
+      const { DRACOLoader } = await import('three/addons/loaders/DRACOLoader.js');
+      const { RGBELoader } = await import('three/addons/loaders/RGBELoader.js');
+      const { EXRLoader } = await import('three/addons/loaders/EXRLoader.js');
+      const { EffectComposer } = await import('three/addons/postprocessing/EffectComposer.js');
+      const { RenderPass } = await import('three/addons/postprocessing/RenderPass.js');
+      const { UnrealBloomPass } = await import('three/addons/postprocessing/UnrealBloomPass.js');
+      const { OutputPass } = await import('three/addons/postprocessing/OutputPass.js');
+      const { RoomEnvironment } = await import('three/addons/environments/RoomEnvironment.js');
+      const { MeshBVH, MeshBVHUniformStruct, BVHShaderGLSL, SAH } = await import('three-mesh-bvh');
+
+      function parseGlb(buf) {
+        const u8 = new Uint8Array(buf);
+        const dv = new DataView(buf);
+        const jsonLen = dv.getUint32(12, true);
+        let jsonText = new TextDecoder().decode(u8.slice(20, 20 + jsonLen));
+        jsonText = jsonText.replace(/[\u0000\s]+$/g, '');
+        const g = JSON.parse(jsonText);
+        const off = 20 + jsonLen;
+        const binLen = dv.getUint32(off, true);
+        return { g, bin: u8.slice(off + 8, off + 8 + binLen) };
+      }
+      function envMeta(g) {
+        return g?.asset?.extras?.adabEmbeddedEnvironment
+          || g?.scenes?.[0]?.extras?.adabEmbeddedEnvironment || null;
+      }
+      function extract(g, bin, idx) {
+        const img = g.images?.[idx];
+        if (!img || img.bufferView == null) return null;
+        const bv = g.bufferViews[img.bufferView];
+        const start = bv.byteOffset || 0;
+        return {
+          blob: new Blob([bin.slice(start, start + bv.byteLength)], { type: img.mimeType || 'application/octet-stream' }),
+          mime: img.mimeType || '',
+        };
+      }
+      async function loadEnv(blob, mime) {
+        const url = URL.createObjectURL(blob);
+        try {
+          const loader = (mime || '').includes('exr') ? new EXRLoader() : new RGBELoader();
+          const tex = await loader.loadAsync(url);
+          tex.mapping = THREE.EquirectangularReflectionMapping;
+          tex.colorSpace = THREE.LinearSRGBColorSpace;
+          return tex;
+        } finally { URL.revokeObjectURL(url); }
+      }
+      function isDiamond(m, o) {
+        if (m?.userData?.adabMaterialRole === 'diamond') return true;
+        const n = ((m?.name || '') + ' ' + (o?.name || '')).toLowerCase();
+        return n.includes('diamond') || n.includes('pave') || n.includes('gem');
+      }
+      function makeDiamondMaterial(env, camera) {
+        return new THREE.ShaderMaterial({
+          uniforms: {
+            envMap: { value: env },
+            bvh: { value: new MeshBVHUniformStruct() },
+            viewMatrixInv: { value: camera.matrixWorld },
+            resolution: { value: new THREE.Vector2(innerWidth, innerHeight) },
+            bounces: { value: 4 },
+            ior: { value: 2.417 },
+            color: { value: new THREE.Color(1, 1, 1) },
+            aberrationStrength: { value: 0.012 },
+          },
+          vertexShader: /* glsl */ `
+            varying vec3 vWorldPosition; varying vec3 vNormal; uniform mat4 viewMatrixInv;
+            void main() {
+              vWorldPosition = (modelMatrix * vec4(position, 1.0)).xyz;
+              vNormal = normalize((viewMatrixInv * vec4(normalMatrix * normal, 0.0)).xyz);
+              gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0);
+            }`,
+          fragmentShader: /* glsl */ `
+            #define RAY_OFFSET 0.001
+            #include <common>
+            precision highp isampler2D; precision highp usampler2D;
+            ${BVHShaderGLSL.common_functions}
+            ${BVHShaderGLSL.bvh_struct_definitions}
+            ${BVHShaderGLSL.bvh_ray_functions}
+            varying vec3 vWorldPosition; varying vec3 vNormal;
+            uniform sampler2D envMap; uniform float bounces; uniform BVH bvh;
+            uniform float ior; uniform vec3 color; uniform mat4 modelMatrix; uniform float aberrationStrength;
+            #include <cube_uv_reflection_fragment>
+            vec3 tir(vec3 origin, vec3 dir, vec3 normal, float iorVal, mat4 invModel) {
+              vec3 rayOrigin = origin; vec3 rayDirection = dir;
+              rayDirection = refract(rayDirection, normal, 1.0 / iorVal);
+              rayOrigin = vWorldPosition + rayDirection * RAY_OFFSET;
+              rayOrigin = (invModel * vec4(rayOrigin, 1.0)).xyz;
+              rayDirection = normalize((invModel * vec4(rayDirection, 0.0)).xyz);
+              for (float i = 0.0; i < bounces; i++) {
+                uvec4 faceIndices = uvec4(0u); vec3 faceNormal = vec3(0.0,0.0,1.0);
+                vec3 barycoord = vec3(0.0); float side = 1.0; float dist = 0.0;
+                bvhIntersectFirstHit(bvh, rayOrigin, rayDirection, faceIndices, faceNormal, barycoord, side, dist);
+                vec3 hitPos = rayOrigin + rayDirection * dist;
+                bool isTir = length(refract(rayDirection, faceNormal, iorVal)) == 0.0;
+                if (!isTir) { rayDirection = refract(rayDirection, faceNormal, iorVal); break; }
+                rayDirection = reflect(rayDirection, faceNormal);
+                rayOrigin = hitPos + rayDirection * RAY_OFFSET;
+              }
+              return normalize((modelMatrix * vec4(rayDirection, 0.0)).xyz);
+            }
+            vec4 envSample(vec3 d) { return texture(envMap, equirectUv(d)); }
+            void main() {
+              mat4 invModel = inverse(modelMatrix);
+              vec3 n = normalize(vNormal);
+              vec3 d = normalize(vWorldPosition - cameraPosition);
+              if (!gl_FrontFacing) n = -n;
+              vec3 r = tir(vWorldPosition, d, n, ior, invModel);
+              vec3 rR = tir(vWorldPosition, d, n, ior * (1.0 + aberrationStrength), invModel);
+              vec3 rB = tir(vWorldPosition, d, n, ior * (1.0 - aberrationStrength), invModel);
+              vec4 c = vec4(envSample(rR).r, envSample(r).g, envSample(rB).b, 1.0) * vec4(color, 1.0);
+              // boost brilliance for tiny pave stones
+              c.rgb = pow(c.rgb, vec3(0.92)) * 1.15;
+              gl_FragColor = c;
+            }`,
+        });
+      }
+
+      set('Fetching ring…');
+      const ab = await fetch(MODEL).then((r) => {
+        if (!r.ok) throw new Error('GLB HTTP ' + r.status);
+        return r.arrayBuffer();
+      });
+      const { g, bin } = parseGlb(ab);
+      const meta = envMeta(g);
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xf2f2f2);
+      const camera = new THREE.PerspectiveCamera(32, innerWidth / innerHeight, 0.01, 5000);
+      const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.05;
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      document.body.appendChild(renderer.domElement);
+
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+      scene.add(new THREE.AmbientLight(0xffffff, 0.25));
+      const key = new THREE.DirectionalLight(0xfff4e8, 0.7);
+      key.position.set(4, 7, 5); scene.add(key);
+
+      let metalEnv = scene.environment;
+      let gemEnv = scene.environment;
+      if (meta?.imageIndex != null) {
+        set('Loading packed HDR…');
+        try {
+          const img = extract(g, bin, meta.imageIndex);
+          metalEnv = await loadEnv(img.blob, img.mime || meta.mimeType);
+          scene.environment = metalEnv;
+          gemEnv = metalEnv;
+        } catch (e) { console.warn(e); }
+      }
+      if (meta?.gemImageIndex != null) {
+        try {
+          const img = extract(g, bin, meta.gemImageIndex);
+          gemEnv = await loadEnv(img.blob, img.mime || meta.gemMimeType);
+        } catch (e) { console.warn(e); }
+      }
+
+      set('Decoding meshes…');
+      const draco = new DRACOLoader();
+      draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/draco/gltf/');
+      const loader = new GLTFLoader();
+      loader.setDRACOLoader(draco);
+      const gltf = await loader.parseAsync(ab, '');
+      const root = gltf.scene;
+      scene.add(root);
+      root.updateMatrixWorld(true);
+
+      const diamondMeshes = [];
+      root.traverse((o) => {
+        if (!o.isMesh) return;
+        o.frustumCulled = false;
+        o.visible = true;
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        const name = (o.name || '').toLowerCase();
+
+        // Hide non-jewelry helper / black side shell that reads wrong
+        if (name.includes('circle001_2') || (mats[0]?.name || '') === 'GDJ_Sides') {
+          o.visible = false;
+          return;
+        }
+
+        if (mats.some((m) => isDiamond(m, o))) {
+          diamondMeshes.push(o);
+          // temporary bright clear look until BVH ready
+          o.material = new THREE.MeshPhysicalMaterial({
+            color: 0xffffff, metalness: 0, roughness: 0,
+            transmission: 1, thickness: 0.08, ior: 2.417,
+            envMap: gemEnv, envMapIntensity: 2.0,
+            transparent: true, opacity: 1,
+            attenuationColor: new THREE.Color(1, 1, 1),
+            attenuationDistance: 1.0,
+            clearcoat: 1, clearcoatRoughness: 0,
+            specularIntensity: 1,
+          });
+          o.renderOrder = 2;
+          return;
+        }
+
+        const old = mats[0];
+        let color = old?.color ? old.color.clone() : new THREE.Color(0.86, 0.62, 0.22);
+        // force warm gold if nearly gray silver on main ring body named Circle001
+        if (name === 'circle001' || (old?.name || '').includes('Gold')) {
+          color = new THREE.Color(0.90, 0.68, 0.28);
+        } else if ((old?.name || '').includes('Silver') || name.includes('prong')) {
+          color = new THREE.Color(0.92, 0.92, 0.94);
+        }
+        o.material = new THREE.MeshStandardMaterial({
+          color, metalness: 1.0, roughness: 0.1, envMapIntensity: 1.45,
+        });
+      });
+
+      const box = new THREE.Box3().setFromObject(root);
+      if (box.isEmpty()) throw new Error('Empty bounds');
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.autoRotate = true;
+      controls.autoRotateSpeed = 0.4;
+      controls.target.copy(center);
+      camera.position.copy(center).add(new THREE.Vector3(maxDim * 0.75, maxDim * 0.5, maxDim * 1.25));
+      camera.near = maxDim / 250;
+      camera.far = maxDim * 40;
+      camera.updateProjectionMatrix();
+      controls.update();
+
+      const composer = new EffectComposer(renderer);
+      composer.addPass(new RenderPass(scene, camera));
+      composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.28, 0.55, 0.82));
+      composer.addPass(new OutputPass());
+
+      set(`${diamondMeshes.length} diamonds visible · building real sparkle…`);
+      renderer.setAnimationLoop(() => { controls.update(); composer.render(); });
+
+      // Proper diamond fire via BVH (this is what plain transmission was missing)
+      const diamondMats = [];
+      for (let i = 0; i < diamondMeshes.length; i++) {
+        const o = diamondMeshes[i];
+        if (i % 8 === 0) {
+          set(`Diamond sparkle ${i + 1}/${diamondMeshes.length}…`);
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        try {
+          o.geometry.computeVertexNormals();
+          // Fix inverted/open pave proxies: ensure volume for refraction
+          const bvh = new MeshBVH(o.geometry, { strategy: SAH, maxLeafTris: 8 });
+          const mat = makeDiamondMaterial(gemEnv, camera);
+          mat.uniforms.bvh.value.updateFrom(bvh);
+          diamondMats.push(mat);
+          o.material = mat;
+        } catch (e) {
+          console.warn('diamond BVH failed', o.name, e);
+        }
+      }
+
+      set(`Pave ring · ${diamondMeshes.length} diamonds with sparkle · drag to orbit`);
+      addEventListener('resize', () => {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+        composer.setSize(innerWidth, innerHeight);
+        for (const m of diamondMats) m.uniforms.resolution.value.set(innerWidth, innerHeight);
+      });
+    } catch (e) {
+      console.error(e);
+      set('Error: ' + (e?.message || e), true);
+    }
+  </script>
+</body>
+</html>
