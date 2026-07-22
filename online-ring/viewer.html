@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Cache-Control" content="no-store" />
-  <title>Online multi-diamond ring</title>
+  <title>Online pave/halo ring · fully baked</title>
   <style>
     html, body { margin: 0; height: 100%; background: #f2f2f2; overflow: hidden; }
     canvas { display: block; width: 100vw; height: 100vh; }
@@ -145,7 +145,7 @@
               vec3 rB = tir(vWorldPosition, d, n, ior * (1.0 - aberrationStrength), invModel);
               vec4 c = vec4(envSample(rR).r, envSample(r).g, envSample(rB).b, 1.0) * vec4(color, 1.0);
               // boost brilliance for tiny pave stones
-              c.rgb = pow(c.rgb, vec3(0.92)) * 1.15;
+              c.rgb = pow(c.rgb, vec3(0.98)) * 0.95;
               gl_FragColor = c;
             }`,
         });
@@ -166,14 +166,14 @@
       renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
       renderer.setSize(innerWidth, innerHeight);
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
-      renderer.toneMappingExposure = 1.05;
+      renderer.toneMappingExposure = 0.68;
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       document.body.appendChild(renderer.domElement);
 
       const pmrem = new THREE.PMREMGenerator(renderer);
       scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-      scene.add(new THREE.AmbientLight(0xffffff, 0.25));
-      const key = new THREE.DirectionalLight(0xfff4e8, 0.7);
+      scene.add(new THREE.AmbientLight(0xffffff, 0.1));
+      const key = new THREE.DirectionalLight(0xfff4e8, 0.28);
       key.position.set(4, 7, 5); scene.add(key);
 
       let metalEnv = scene.environment;
@@ -184,6 +184,7 @@
           const img = extract(g, bin, meta.imageIndex);
           metalEnv = await loadEnv(img.blob, img.mime || meta.mimeType);
           scene.environment = metalEnv;
+          scene.environmentIntensity = 0.55;
           gemEnv = metalEnv;
         } catch (e) { console.warn(e); }
       }
@@ -224,7 +225,7 @@
           o.material = new THREE.MeshPhysicalMaterial({
             color: 0xffffff, metalness: 0, roughness: 0,
             transmission: 1, thickness: 0.08, ior: 2.417,
-            envMap: gemEnv, envMapIntensity: 2.0,
+            envMap: gemEnv, envMapIntensity: 1.05,
             transparent: true, opacity: 1,
             attenuationColor: new THREE.Color(1, 1, 1),
             attenuationDistance: 1.0,
@@ -244,7 +245,7 @@
           color = new THREE.Color(0.92, 0.92, 0.94);
         }
         o.material = new THREE.MeshStandardMaterial({
-          color, metalness: 1.0, roughness: 0.1, envMapIntensity: 1.45,
+          color, metalness: 1.0, roughness: 0.14, envMapIntensity: 0.85,
         });
       });
 
@@ -266,7 +267,7 @@
 
       const composer = new EffectComposer(renderer);
       composer.addPass(new RenderPass(scene, camera));
-      composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.28, 0.55, 0.82));
+      composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.1, 0.4, 0.9));
       composer.addPass(new OutputPass());
 
       set(`${diamondMeshes.length} diamonds visible · building real sparkle…`);
